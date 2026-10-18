@@ -491,3 +491,22 @@ export const getHistoricalTrends = async (ticker, period = '1M', startDate, endD
   trendCache.set(cacheKey, { timestamp: now, data: history });
   return history;
 };
+
+// ==========================================
+// 6. Backward-Compatibility Aliases
+// ==========================================
+// Allows controllers expecting getLivePrice or getPrice to work seamlessly
+export const getLivePrice = async (ticker) => {
+  const quote = await getDetailedQuote(ticker);
+  return quote.price;
+};
+
+export const getPrice = getLivePrice;
+
+export default {
+  getDetailedQuote,
+  getLivePrice,
+  getPrice,
+  getHistoricalTrends,
+  INDIAN_STOCKS_FALLBACK,
+};
