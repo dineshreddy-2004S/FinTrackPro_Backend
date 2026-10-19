@@ -1,13 +1,37 @@
 import { v4 as uuidv4 } from 'uuid';
 import { pool } from '../config/db.js';
-import { getLivePrice } from '../services/marketData.js';
+import { getDetailedQuote } from '../services/marketData.js';
 
+// ==========================================
+// 1. Get Portfolio Summary & Holdings
+// ==========================================
 export const getPortfolio = async (req, res) => {
-  const userId = req.user.id;
+  const userId = req.user?.id;
+
+  if (!userId) {
+    return res.status(401).json({ message: 'Unauthorized: Missing user token' });
+  }
 
   try {
-    const [holdings] = await pool.query(
-      'SELECT * FROM holdings WHERE user_id = ? ORDER BY asset_class ASC, ticker ASC',
+    // 1. Ensure Table Exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS holdings (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        ticker VARCHAR(20) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        asset_class VARCHAR(50) DEFAULT 'Stocks',
+        shares DECIMAL(15, 4) NOT NULL DEFAULT 0,
+        cost_basis DECIMAL(15, 2) NOT NULL DEFAULT 0,
+        purchase_date DATE NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX user_idx (user_id)
+      )
+    `);
+
+    // 2. Query Holdings safely using SELECT *
+    const [rawRows] = await pool.query(
+      'SELECT * FROM holdings WHERE user_id = ? ORDER BY created_at DESC',
       [userId]
     );
 
@@ -15,152 +39,185 @@ export const getPortfolio = async (req, res) => {
     let totalCostBasis = 0;
     let totalProjectedAnnualDividends = 0;
 
+    // 3. Process Each Holding Safely
     const enrichedHoldings = await Promise.all(
-      holdings.map(async (item) => {
-        const isLiquid = item.asset_class === 'Liquid';
-        let currentPrice = 0;
-        let marketValue = 0;
-        let totalCost = 0;
+      rawRows.map(async (row) => {
+        const ticker = (row.ticker || '').trim().toUpperCase();
+        let quote;
 
-        if (isLiquid) {
-          marketValue = Number(item.manual_market_value || 0);
-          totalCost = marketValue;
-          currentPrice = 1.0;
-        } else {
-          currentPrice = await getLivePrice(item.ticker);
-          const shares = Number(item.shares || 0);
-          const costBasis = Number(item.cost_basis || 0);
-          marketValue = shares * currentPrice;
-          totalCost = shares * costBasis;
+        try {
+          quote = await getDetailedQuote(ticker);
+        } catch (quoteErr) {
+          console.warn(`[Quote Warning for ${ticker}]:`, quoteErr.message);
+          quote = { price: Number(row.cost_basis) || 100, name: row.name || ticker };
         }
 
-        const gainLossRupees = marketValue - totalCost;
-        const gainLossPercent = totalCost > 0 ? (gainLossRupees / totalCost) * 100 : 0;
+        const shares = Number(row.shares) || 0;
+        const costBasis = Number(row.cost_basis) || 0;
+        const currentPrice = Number(quote?.price) || costBasis || 0;
 
-        // Estimated dividend yield heuristics for Indian instruments
-        let estimatedDivYield = 0;
-        if (item.asset_class === 'Stocks') {
-          estimatedDivYield = item.ticker === 'TCS' ? 2.1 : item.ticker === 'RELIANCE' ? 0.35 : 1.2;
-        } else if (item.asset_class === 'ETFs') {
-          estimatedDivYield = 1.1;
-        } else if (item.asset_class === 'Liquid') {
-          estimatedDivYield = 6.5; // FD / Savings interest yield
-        }
-        const annualDividend = (marketValue * estimatedDivYield) / 100;
+        const totalCost = Number((shares * costBasis).toFixed(2));
+        const marketValue = Number((shares * currentPrice).toFixed(2));
+        const gainLossRupees = Number((marketValue - totalCost).toFixed(2));
+        const gainLossPercent = totalCost > 0 ? Number(((gainLossRupees / totalCost) * 100).toFixed(2)) : 0;
+        const divYield = Number(quote?.estimatedDivYield || 1.2);
 
         totalMarketValue += marketValue;
         totalCostBasis += totalCost;
-        totalProjectedAnnualDividends += annualDividend;
+        totalProjectedAnnualDividends += (marketValue * divYield) / 100;
 
         return {
-          id: item.id,
-          ticker: item.ticker,
-          name: item.name,
-          assetClass: item.asset_class,
-          shares: isLiquid ? null : Number(item.shares),
-          costBasis: isLiquid ? null : Number(item.cost_basis),
-          currentPrice: isLiquid ? null : currentPrice,
+          id: row.id,
+          ticker,
+          name: row.name || quote?.name || ticker,
+          assetClass: row.asset_class || 'Stocks',
+          shares,
+          costBasis,
+          currentPrice,
           marketValue,
           totalCost,
           gainLossRupees,
           gainLossPercent,
-          estimatedDivYield,
-          annualDividend,
+          estimatedDivYield: divYield,
         };
       })
     );
 
-    // Grouping asset classes
-    const assetClassMap = { Stocks: 0, ETFs: 0, Alternatives: 0, Liquid: 0 };
+    // 4. Portfolio Return Aggregations
+    const totalGainLossRupees = Number((totalMarketValue - totalCostBasis).toFixed(2));
+    const totalReturnPercent = totalCostBasis > 0 
+      ? Number(((totalGainLossRupees / totalCostBasis) * 100).toFixed(2)) 
+      : 0;
 
-    const itemsWithWeights = enrichedHoldings.map((h) => {
-      const weight = totalMarketValue > 0 ? (h.marketValue / totalMarketValue) * 100 : 0;
-      if (assetClassMap[h.assetClass] !== undefined) {
-        assetClassMap[h.assetClass] += h.marketValue;
-      }
+    let maxWeight = 0;
+    const finalHoldings = enrichedHoldings.map((h) => {
+      const weight = totalMarketValue > 0 ? Number(((h.marketValue / totalMarketValue) * 100).toFixed(2)) : 0;
+      if (weight > maxWeight) maxWeight = weight;
       return { ...h, weight };
     });
 
-    const totalGainLossRupees = totalMarketValue - totalCostBasis;
-    const totalReturnPercent = totalCostBasis > 0 ? (totalGainLossRupees / totalCostBasis) * 100 : 0;
+    // 5. Allocation Breakdown
+    const allocationMap = {};
+    finalHoldings.forEach((h) => {
+      allocationMap[h.assetClass] = (allocationMap[h.assetClass] || 0) + h.marketValue;
+    });
 
-    // Top 5 Holdings
-    const topHoldings = [...itemsWithWeights]
-      .sort((a, b) => b.marketValue - a.marketValue)
-      .slice(0, 5)
-      .map((item, index) => ({
-        rank: index + 1,
-        ticker: item.ticker,
-        marketValue: item.marketValue,
-      }));
-
-    // Asset allocation percentages
-    const assetAllocation = Object.keys(assetClassMap).map((key) => ({
-      name: key,
-      value: assetClassMap[key],
-      percentage: totalMarketValue > 0 ? (assetClassMap[key] / totalMarketValue) * 100 : 0,
+    const assetAllocation = Object.entries(allocationMap).map(([name, value]) => ({
+      name,
+      value: Number(value.toFixed(2)),
+      percentage: totalMarketValue > 0 ? Number(((value / totalMarketValue) * 100).toFixed(2)) : 0,
     }));
 
-    // Indian Capital Gains Tax Projections
-    // Assuming 65% LTCG & 35% STCG distribution across active equity gains
-    const equityGains = totalGainLossRupees > 0 ? totalGainLossRupees : 0;
-    const estimatedLtcgGains = equityGains * 0.65;
-    const estimatedStcgGains = equityGains * 0.35;
-    const taxableLtcg = Math.max(0, estimatedLtcgGains - 125000); // 1.25L exemption
-    const projectedTaxLiability = (taxableLtcg * 0.125) + (estimatedStcgGains * 0.20);
+    // 6. Top 5 Holdings
+    const topHoldings = [...finalHoldings]
+      .sort((a, b) => b.marketValue - a.marketValue)
+      .slice(0, 5)
+      .map((h, idx) => ({
+        rank: idx + 1,
+        ticker: h.ticker,
+        marketValue: h.marketValue,
+        weight: h.weight,
+      }));
 
-    // Portfolio Risk Score (Concentration Index)
-    const maxWeight = Math.max(...itemsWithWeights.map((w) => w.weight), 0);
-    const riskLevel = maxWeight > 35 ? 'High (Over-concentrated)' : maxWeight > 20 ? 'Moderate' : 'Balanced & Well Diversified';
+    // 7. Capital Gains Liability (LTCG @ 12.5% over ₹1.25L exemption)
+    const taxableGains = Math.max(0, totalGainLossRupees - 125000);
+    const projectedTaxLiability = Number((taxableGains * 0.125).toFixed(2));
 
-    res.json({
+    return res.status(200).json({
       summary: {
-        totalMarketValue,
-        totalCostBasis,
+        totalMarketValue: Number(totalMarketValue.toFixed(2)),
+        totalCostBasis: Number(totalCostBasis.toFixed(2)),
         totalGainLossRupees,
         totalReturnPercent,
-        totalProjectedAnnualDividends,
         projectedTaxLiability,
-        riskLevel,
+        totalProjectedAnnualDividends: Number(totalProjectedAnnualDividends.toFixed(2)),
         maxSingleHoldingWeight: maxWeight,
-        holdingsCount: enrichedHoldings.length,
+        riskLevel: maxWeight > 40 ? 'High Concentration' : maxWeight > 25 ? 'Moderate' : 'Diversified',
         lastUpdated: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
       },
-      holdings: itemsWithWeights,
+      holdings: finalHoldings,
       assetAllocation,
       topHoldings,
     });
-  } catch (error) {
-    res.status(500).json({ message: 'Error retrieving portfolio', error: error.message });
+  } catch (err) {
+    console.error('====================================');
+    console.error('🔥 [CRITICAL GET PORTFOLIO ERROR]:', err);
+    console.error('====================================');
+    return res.status(500).json({
+      message: 'Failed to retrieve portfolio data',
+      error: err.message,
+    });
   }
 };
 
+// ==========================================
+// 2. Add New Holding
+// ==========================================
 export const addHolding = async (req, res) => {
-  const userId = req.user.id;
-  const { ticker, name, assetClass, shares, costBasis, manualMarketValue } = req.body;
+  const userId = req.user?.id;
+  const { ticker, name, assetClass, shares, costBasis, purchaseDate } = req.body;
+
+  if (!ticker || shares === undefined || costBasis === undefined) {
+    return res.status(400).json({ message: 'Ticker, shares quantity, and cost basis are required.' });
+  }
+
+  const numShares = Number(shares);
+  const numCostBasis = Number(costBasis);
+
+  if (numShares <= 0 || numCostBasis <= 0) {
+    return res.status(400).json({ message: 'Shares and buy price must be positive numbers.' });
+  }
 
   try {
     const id = uuidv4();
+    const cleanTicker = ticker.trim().toUpperCase();
+    const resolvedName = name?.trim() || cleanTicker;
+    const resolvedAssetClass = assetClass || 'Stocks';
+    const resolvedDate = purchaseDate || new Date().toISOString().split('T')[0];
+
     await pool.query(
-      `INSERT INTO holdings (id, user_id, ticker, name, asset_class, shares, cost_basis, manual_market_value)
+      `INSERT INTO holdings (id, user_id, ticker, name, asset_class, shares, cost_basis, purchase_date)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, userId, ticker.toUpperCase(), name, assetClass, shares || 0, costBasis || 0, manualMarketValue || null]
+      [id, userId, cleanTicker, resolvedName, resolvedAssetClass, numShares, numCostBasis, resolvedDate]
     );
 
-    res.status(201).json({ message: 'Investment added successfully.', id });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to add investment.', error: error.message });
+    return res.status(201).json({ message: 'Holding registered successfully', id });
+  } catch (err) {
+    console.error('[Portfolio Add Error]:', err);
+    return res.status(500).json({ message: 'Error adding holding', error: err.message });
   }
 };
 
+// ==========================================
+// 3. Delete Holding
+// ==========================================
 export const deleteHolding = async (req, res) => {
-  const userId = req.user.id;
+  const userId = req.user?.id;
   const { id } = req.params;
 
-  try {
-    await pool.query('DELETE FROM holdings WHERE id = ? AND user_id = ?', [id, userId]);
-    res.json({ message: 'Holding deleted successfully.' });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to delete holding.', error: error.message });
+  if (!id) {
+    return res.status(400).json({ message: 'Holding ID is required.' });
   }
+
+  try {
+    const [result] = await pool.query(
+      'DELETE FROM holdings WHERE id = ? AND user_id = ?',
+      [id, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Holding not found or unauthorized.' });
+    }
+
+    return res.json({ message: 'Holding deleted successfully' });
+  } catch (err) {
+    console.error('[Portfolio Delete Error]:', err);
+    return res.status(500).json({ message: 'Error deleting holding', error: err.message });
+  }
+};
+
+export default {
+  getPortfolio,
+  addHolding,
+  deleteHolding,
 };

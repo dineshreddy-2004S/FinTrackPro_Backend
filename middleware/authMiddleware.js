@@ -1,17 +1,34 @@
 import jwt from 'jsonwebtoken';
 
-export const protect = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ message: 'Unauthorized. No token provided.' });
+export const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'] || req.headers['Authorization'];
+  const token =
+    authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.split(' ')[1]
+      : authHeader;
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access denied: No authentication token provided' });
   }
 
-  const token = authHeader.split(' ')[1];
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
+  const secret = process.env.JWT_SECRET || 'fallback_default_fintrackpro_jwt_secret_key_2026';
+
+  jwt.verify(token, secret, (err, decodedUser) => {
+    if (err) {
+      console.error('[JWT Verification Failure]:', err.message);
+      return res.status(403).json({
+        message: 'Forbidden: Invalid or expired authentication token',
+        error: err.message,
+      });
+    }
+
+    req.user = decodedUser;
     next();
-  } catch (error) {
-    return res.status(403).json({ message: 'Token invalid or expired.' });
-  }
+  });
 };
+
+// Aliases so routes importing { protect } or { authenticateToken } both work
+export const protect = authenticateToken;
+export const verifyToken = authenticateToken;
+
+export default authenticateToken;
