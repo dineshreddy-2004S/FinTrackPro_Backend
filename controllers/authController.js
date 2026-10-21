@@ -47,9 +47,13 @@ export const register = async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, salt);
     const userId = uuidv4();
 
-    // Insert user
+    // Inspect columns dynamically to support both 'password' and 'password_hash' schemas
+    const [columns] = await pool.query('SHOW COLUMNS FROM users');
+    const colNames = columns.map((c) => c.Field);
+    const passwordColumn = colNames.includes('password_hash') ? 'password_hash' : 'password';
+
     await pool.query(
-      'INSERT INTO users (id, name, email, password) VALUES (?, ?, ?, ?)',
+      `INSERT INTO users (id, name, email, ${passwordColumn}) VALUES (?, ?, ?, ?)`,
       [userId, name.trim(), normalizedEmail, hashedPassword]
     );
 
@@ -93,9 +97,9 @@ export const login = async (req, res) => {
   const normalizedEmail = email.trim().toLowerCase();
 
   try {
-    // Query user record
+    // Query with SELECT * to avoid ER_BAD_FIELD_ERROR if column is password_hash
     const [rows] = await pool.query(
-      'SELECT id, name, email, password FROM users WHERE email = ? LIMIT 1',
+      'SELECT * FROM users WHERE email = ? LIMIT 1',
       [normalizedEmail]
     );
 
@@ -105,8 +109,16 @@ export const login = async (req, res) => {
 
     const user = rows[0];
 
+    // Read whichever column exists in the TiDB table schema
+    const storedPasswordHash = user.password || user.password_hash || user.passwordHash;
+
+    if (!storedPasswordHash) {
+      console.error('[Login Error]: User record has no password or password_hash field', user);
+      return res.status(500).json({ message: 'Server configuration error: password field missing.' });
+    }
+
     // Verify password hash
-    const isMatch = await bcrypt.compare(password, user.password);
+    const isMatch = await bcrypt.compare(password, storedPasswordHash);
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid credentials. Incorrect password.' });
     }
@@ -165,4 +177,10 @@ export const getMe = async (req, res) => {
       error: err.message,
     });
   }
+};
+
+export default {
+  register,
+  login,
+  getMe,
 };
