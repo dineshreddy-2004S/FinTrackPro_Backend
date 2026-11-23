@@ -15,7 +15,8 @@ export const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 15,
   queueLimit: 0,
-  enableKeepAlive: true,        // Keeps connection alive
+  enableKeepAlive: true,    // Keeps connection alive
+  connectTimeout: 15000,        
   keepAliveInitialDelay: 10000, // Sends ping every 10s
 });
 
