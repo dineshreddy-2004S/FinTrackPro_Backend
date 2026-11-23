@@ -39,27 +39,30 @@ export const getPortfolio = async (req, res) => {
     let totalCostBasis = 0;
     let totalProjectedAnnualDividends = 0;
 
-    // 3. Process Each Holding Safely
+    // 3. Process Each Holding Safely (supports alternate column names)
     const enrichedHoldings = await Promise.all(
       rawRows.map(async (row) => {
-        const ticker = (row.ticker || '').trim().toUpperCase();
-        let quote;
+        const ticker = (row.ticker || row.symbol || '').trim().toUpperCase();
+        const shares = Number(row.shares ?? row.quantity) || 0;
+        const costBasis = Number(row.cost_basis ?? row.buy_price ?? row.avg_price) || 0;
+        const resolvedName = row.name || row.company_name || ticker;
+        const resolvedAssetClass = row.asset_class || row.category || 'Stocks';
 
+        let quote;
         try {
           quote = await getDetailedQuote(ticker);
         } catch (quoteErr) {
           console.warn(`[Quote Warning for ${ticker}]:`, quoteErr.message);
-          quote = { price: Number(row.cost_basis) || 100, name: row.name || ticker };
+          quote = { price: costBasis || 100, name: resolvedName };
         }
 
-        const shares = Number(row.shares) || 0;
-        const costBasis = Number(row.cost_basis) || 0;
         const currentPrice = Number(quote?.price) || costBasis || 0;
 
         const totalCost = Number((shares * costBasis).toFixed(2));
         const marketValue = Number((shares * currentPrice).toFixed(2));
         const gainLossRupees = Number((marketValue - totalCost).toFixed(2));
-        const gainLossPercent = totalCost > 0 ? Number(((gainLossRupees / totalCost) * 100).toFixed(2)) : 0;
+        const gainLossPercent =
+          totalCost > 0 ? Number(((gainLossRupees / totalCost) * 100).toFixed(2)) : 0;
         const divYield = Number(quote?.estimatedDivYield || 1.2);
 
         totalMarketValue += marketValue;
@@ -69,8 +72,8 @@ export const getPortfolio = async (req, res) => {
         return {
           id: row.id,
           ticker,
-          name: row.name || quote?.name || ticker,
-          assetClass: row.asset_class || 'Stocks',
+          name: resolvedName || quote?.name || ticker,
+          assetClass: resolvedAssetClass,
           shares,
           costBasis,
           currentPrice,
@@ -85,13 +88,15 @@ export const getPortfolio = async (req, res) => {
 
     // 4. Portfolio Return Aggregations
     const totalGainLossRupees = Number((totalMarketValue - totalCostBasis).toFixed(2));
-    const totalReturnPercent = totalCostBasis > 0 
-      ? Number(((totalGainLossRupees / totalCostBasis) * 100).toFixed(2)) 
-      : 0;
+    const totalReturnPercent =
+      totalCostBasis > 0
+        ? Number(((totalGainLossRupees / totalCostBasis) * 100).toFixed(2))
+        : 0;
 
     let maxWeight = 0;
     const finalHoldings = enrichedHoldings.map((h) => {
-      const weight = totalMarketValue > 0 ? Number(((h.marketValue / totalMarketValue) * 100).toFixed(2)) : 0;
+      const weight =
+        totalMarketValue > 0 ? Number(((h.marketValue / totalMarketValue) * 100).toFixed(2)) : 0;
       if (weight > maxWeight) maxWeight = weight;
       return { ...h, weight };
     });
@@ -132,8 +137,13 @@ export const getPortfolio = async (req, res) => {
         projectedTaxLiability,
         totalProjectedAnnualDividends: Number(totalProjectedAnnualDividends.toFixed(2)),
         maxSingleHoldingWeight: maxWeight,
-        riskLevel: maxWeight > 40 ? 'High Concentration' : maxWeight > 25 ? 'Moderate' : 'Diversified',
-        lastUpdated: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        riskLevel:
+          maxWeight > 40 ? 'High Concentration' : maxWeight > 25 ? 'Moderate' : 'Diversified',
+        lastUpdated: new Date().toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }),
       },
       holdings: finalHoldings,
       assetAllocation,
@@ -151,40 +161,137 @@ export const getPortfolio = async (req, res) => {
 };
 
 // ==========================================
-// 2. Add New Holding
+// 2. Add New Holding (Schema-Adaptive)
 // ==========================================
 export const addHolding = async (req, res) => {
   const userId = req.user?.id;
-  const { ticker, name, assetClass, shares, costBasis, purchaseDate } = req.body;
+  const rawTicker = req.body.ticker || req.body.symbol;
+  const rawShares = req.body.shares ?? req.body.quantity;
+  const rawCost =
+    req.body.costBasis ?? req.body.buyPrice ?? req.body.avgPrice ?? req.body.cost_basis;
+  const { name, assetClass, purchaseDate } = req.body;
 
-  if (!ticker || shares === undefined || costBasis === undefined) {
+  if (!userId) {
+    return res.status(401).json({ message: 'Unauthorized: Missing user token.' });
+  }
+
+  if (!rawTicker || rawShares === undefined || rawCost === undefined) {
     return res.status(400).json({ message: 'Ticker, shares quantity, and cost basis are required.' });
   }
 
-  const numShares = Number(shares);
-  const numCostBasis = Number(costBasis);
+  const numShares = Number(rawShares);
+  const numCostBasis = Number(rawCost);
 
-  if (numShares <= 0 || numCostBasis <= 0) {
+  if (Number.isNaN(numShares) || Number.isNaN(numCostBasis) || numShares <= 0 || numCostBasis <= 0) {
     return res.status(400).json({ message: 'Shares and buy price must be positive numbers.' });
   }
 
   try {
+    // Ensure table exists if not created yet
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS holdings (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        ticker VARCHAR(20) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        asset_class VARCHAR(50) DEFAULT 'Stocks',
+        shares DECIMAL(15, 4) NOT NULL DEFAULT 0,
+        cost_basis DECIMAL(15, 2) NOT NULL DEFAULT 0,
+        purchase_date DATE NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX user_idx (user_id)
+      )
+    `);
+
+    // Inspect actual TiDB Cloud columns to avoid ER_BAD_FIELD_ERROR
+    const [columns] = await pool.query('SHOW COLUMNS FROM holdings');
+    const colMap = new Map(columns.map((c) => [c.Field.toLowerCase(), c]));
+
     const id = uuidv4();
-    const cleanTicker = ticker.trim().toUpperCase();
+    const cleanTicker = rawTicker.trim().toUpperCase();
     const resolvedName = name?.trim() || cleanTicker;
     const resolvedAssetClass = assetClass || 'Stocks';
     const resolvedDate = purchaseDate || new Date().toISOString().split('T')[0];
 
-    await pool.query(
-      `INSERT INTO holdings (id, user_id, ticker, name, asset_class, shares, cost_basis, purchase_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, userId, cleanTicker, resolvedName, resolvedAssetClass, numShares, numCostBasis, resolvedDate]
-    );
+    const insertCols = [];
+    const insertVals = [];
+
+    const idCol = colMap.get('id');
+    if (idCol && !idCol.Extra.includes('auto_increment')) {
+      insertCols.push('id');
+      insertVals.push(id);
+    }
+
+    if (colMap.has('user_id')) {
+      insertCols.push('user_id');
+      insertVals.push(userId);
+    }
+
+    if (colMap.has('ticker')) {
+      insertCols.push('ticker');
+      insertVals.push(cleanTicker);
+    } else if (colMap.has('symbol')) {
+      insertCols.push('symbol');
+      insertVals.push(cleanTicker);
+    }
+
+    if (colMap.has('name')) {
+      insertCols.push('name');
+      insertVals.push(resolvedName);
+    } else if (colMap.has('company_name')) {
+      insertCols.push('company_name');
+      insertVals.push(resolvedName);
+    }
+
+    if (colMap.has('asset_class')) {
+      insertCols.push('asset_class');
+      insertVals.push(resolvedAssetClass);
+    } else if (colMap.has('category')) {
+      insertCols.push('category');
+      insertVals.push(resolvedAssetClass);
+    }
+
+    if (colMap.has('shares')) {
+      insertCols.push('shares');
+      insertVals.push(numShares);
+    } else if (colMap.has('quantity')) {
+      insertCols.push('quantity');
+      insertVals.push(numShares);
+    }
+
+    if (colMap.has('cost_basis')) {
+      insertCols.push('cost_basis');
+      insertVals.push(numCostBasis);
+    } else if (colMap.has('buy_price')) {
+      insertCols.push('buy_price');
+      insertVals.push(numCostBasis);
+    } else if (colMap.has('avg_price')) {
+      insertCols.push('avg_price');
+      insertVals.push(numCostBasis);
+    }
+
+    if (colMap.has('purchase_date')) {
+      insertCols.push('purchase_date');
+      insertVals.push(resolvedDate);
+    }
+
+    const placeholders = insertCols.map(() => '?').join(', ');
+    const sql = `INSERT INTO holdings (${insertCols.join(', ')}) VALUES (${placeholders})`;
+
+    await pool.query(sql, insertVals);
 
     return res.status(201).json({ message: 'Holding registered successfully', id });
   } catch (err) {
-    console.error('[Portfolio Add Error]:', err);
-    return res.status(500).json({ message: 'Error adding holding', error: err.message });
+    console.error('🔥 [Portfolio Add Error]:', {
+      message: err.message,
+      code: err.code,
+      sqlMessage: err.sqlMessage,
+      sql: err.sql,
+    });
+    return res.status(500).json({
+      message: 'Error adding holding',
+      error: err.sqlMessage || err.message,
+    });
   }
 };
 
